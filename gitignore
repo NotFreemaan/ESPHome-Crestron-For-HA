@@ -1,0 +1,66 @@
+# ESPHome build artifacts
+.esphome/
+**/.pioenvs/
+**/.piolibdeps/
+**/lib/
+**/src/
+**/platformio.ini
+
+# Secrets - NEVER commit these!
+secrets.yaml
+*.key
+*.pem
+
+# ESPHome backup files
+*.bak
+*.backup
+
+# Compiled binaries
+*.bin
+*.elf
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.Trash-*
+
+# Custom - if users create local test configs
+test_*.yaml
+local_*.yaml
+my_*.yaml

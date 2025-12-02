@@ -1,0 +1,810 @@
+#SYMBOL_NAME "ESPHome Bridge for HA v1.0"
+#HINT "Bidirectional TCP bridge for ESPHome integration to Home Assistant"
+#DEFAULT_VOLATILE
+#CATEGORY "46" // Network
+#PRINT_TO_TRACE
+#ENABLE_STACK_CHECKING
+#ENABLE_TRACE
+
+#HELP_BEGIN
+===============================================================================
+ESPHome Bridge for Home Assistant
+===============================================================================
+
+OVERVIEW:
+This module provides bidirectional TCP communication between Crestron control
+systems and ESPHome devices for Home Assistant integration. Supports 16 lights,
+4 video endpoints with 8 sources each, 4 volume zones, and 4 mute controls.
+
+-------------------------------------------------------------------------------
+FEATURES:
+-------------------------------------------------------------------------------
+- 16 bidirectional light controls with real-time feedback
+- 4 video endpoints with 8 source routing per endpoint
+- 4 volume zones with 0-65535 analog control
+- 4 mute controls with bidirectional feedback
+- Automatic reconnection on connection loss
+- Status query support for all control types
+- Debug outputs for TX/RX monitoring
+- Connection status feedback
+
+-------------------------------------------------------------------------------
+PROTOCOL SPECIFICATION:
+-------------------------------------------------------------------------------
+
+Commands from ESPHome to Crestron:
+  LIGHT:X:ON          - Turn light X on (X = 1-16)
+  LIGHT:X:OFF         - Turn light X off (X = 1-16)
+  QUERY:X             - Request status of light X
+  VIDEO:E:S           - Route source S to endpoint E (E=1-4, S=0-8, 0=off)
+  VQUERY:E            - Request video routing status for endpoint E
+  VOLUME:Z:L          - Set volume zone Z to level L (Z=1-4, L=0-65535)
+  VOLQUERY:Z          - Request volume status for zone Z
+  MUTE:Z:S            - Set mute zone Z to state S (Z=1-4, S=0/1)
+  MUTEQUERY:Z         - Request mute status for zone Z
+  KEEPALIVE           - Connection keepalive (ignored)
+
+Commands from Crestron to ESPHome:
+  STATUS:X:Y          - Light X status (Y = 0=off, 1=on)
+  VSTATUS:E:S         - Video endpoint E routed to source S (S=0 means off)
+  VOLSTATUS:Z:L       - Volume zone Z at level L (L=0-65535)
+  MUTE:Z:S            - Mute zone Z state (S=0=unmuted, 1=muted)
+
+===============================================================================
+#HELP_END
+
+// ========== INPUTS ==========
+DIGITAL_INPUT
+  Connect,
+  Disconnect,
+  _skip_,
+  Light_1_FB,  Light_2_FB,  Light_3_FB,  Light_4_FB,
+  Light_5_FB,  Light_6_FB,  Light_7_FB,  Light_8_FB,
+  Light_9_FB,  Light_10_FB, Light_11_FB, Light_12_FB,
+  Light_13_FB, Light_14_FB, Light_15_FB, Light_16_FB,
+  _skip_,
+  Endpoint_1_Source_1_FB, Endpoint_1_Source_2_FB, Endpoint_1_Source_3_FB, Endpoint_1_Source_4_FB,
+  Endpoint_1_Source_5_FB, Endpoint_1_Source_6_FB, Endpoint_1_Source_7_FB, Endpoint_1_Source_8_FB,
+  _skip_,
+  Endpoint_2_Source_1_FB, Endpoint_2_Source_2_FB, Endpoint_2_Source_3_FB, Endpoint_2_Source_4_FB,
+  Endpoint_2_Source_5_FB, Endpoint_2_Source_6_FB, Endpoint_2_Source_7_FB, Endpoint_2_Source_8_FB,
+  _skip_,
+  Endpoint_3_Source_1_FB, Endpoint_3_Source_2_FB, Endpoint_3_Source_3_FB, Endpoint_3_Source_4_FB,
+  Endpoint_3_Source_5_FB, Endpoint_3_Source_6_FB, Endpoint_3_Source_7_FB, Endpoint_3_Source_8_FB,
+  _skip_,
+  Endpoint_4_Source_1_FB, Endpoint_4_Source_2_FB, Endpoint_4_Source_3_FB, Endpoint_4_Source_4_FB,
+  Endpoint_4_Source_5_FB, Endpoint_4_Source_6_FB, Endpoint_4_Source_7_FB, Endpoint_4_Source_8_FB,
+  _skip_,
+  Mute_1_FB, Mute_2_FB, Mute_3_FB, Mute_4_FB,
+  _skip_;
+
+ANALOG_INPUT
+  Volume_1_FB, Volume_2_FB, Volume_3_FB, Volume_4_FB,
+  _skip_;
+
+STRING_INPUT
+  ESP_IP$[50],
+  ESP_Port$[10];
+
+// ========== OUTPUTS ==========
+DIGITAL_OUTPUT
+  Connected_Fb,
+  Disconnected_Fb,
+  _skip_,
+  Light_1,  Light_2,  Light_3,  Light_4,
+  Light_5,  Light_6,  Light_7,  Light_8,
+  Light_9,  Light_10, Light_11, Light_12,
+  Light_13, Light_14, Light_15, Light_16,
+  _skip_,
+  Endpoint_1_Source_1, Endpoint_1_Source_2, Endpoint_1_Source_3, Endpoint_1_Source_4,
+  Endpoint_1_Source_5, Endpoint_1_Source_6, Endpoint_1_Source_7, Endpoint_1_Source_8,
+  _skip_,
+  Endpoint_2_Source_1, Endpoint_2_Source_2, Endpoint_2_Source_3, Endpoint_2_Source_4,
+  Endpoint_2_Source_5, Endpoint_2_Source_6, Endpoint_2_Source_7, Endpoint_2_Source_8,
+  _skip_,
+  Endpoint_3_Source_1, Endpoint_3_Source_2, Endpoint_3_Source_3, Endpoint_3_Source_4,
+  Endpoint_3_Source_5, Endpoint_3_Source_6, Endpoint_3_Source_7, Endpoint_3_Source_8,
+  _skip_,
+  Endpoint_4_Source_1, Endpoint_4_Source_2, Endpoint_4_Source_3, Endpoint_4_Source_4,
+  Endpoint_4_Source_5, Endpoint_4_Source_6, Endpoint_4_Source_7, Endpoint_4_Source_8,
+  _skip_,
+  Mute_1, Mute_2, Mute_3, Mute_4,
+  _skip_;
+
+ANALOG_OUTPUT
+  Volume_1, Volume_2, Volume_3, Volume_4;
+
+STRING_OUTPUT
+  _skip_,
+  TX_Debug$,
+  RX_Debug$,
+  Status$;
+
+/*******************************************************************************************
+  GLOBAL VARIABLES
+*******************************************************************************************/
+TCP_CLIENT myClient[2000];
+INTEGER last_socket_status;
+INTEGER reconnect_timer_running;
+INTEGER manual_disconnect;
+
+/*******************************************************************************************
+  FUNCTION: UpdateConnectionFeedback
+  Updates the connection status outputs
+*******************************************************************************************/
+FUNCTION UpdateConnectionFeedback(INTEGER is_connected)
+{
+    IF (is_connected = 1)
+    {
+        Connected_Fb = ON;
+        Disconnected_Fb = OFF;
+    }
+    ELSE
+    {
+        Connected_Fb = OFF;
+        Disconnected_Fb = ON;
+    }
+}
+
+/*******************************************************************************************
+  FUNCTION: SendStatus
+  Sends light status to ESPHome (STATUS:light_num:state)
+*******************************************************************************************/
+FUNCTION SendStatus(INTEGER light_num)
+{
+    INTEGER state;
+    STRING temp[50];
+    
+    state = 0;
+    
+    IF (light_num = 1 && Light_1_FB = 1) state = 1;
+    ELSE IF (light_num = 2 && Light_2_FB = 1) state = 1;
+    ELSE IF (light_num = 3 && Light_3_FB = 1) state = 1;
+    ELSE IF (light_num = 4 && Light_4_FB = 1) state = 1;
+    ELSE IF (light_num = 5 && Light_5_FB = 1) state = 1;
+    ELSE IF (light_num = 6 && Light_6_FB = 1) state = 1;
+    ELSE IF (light_num = 7 && Light_7_FB = 1) state = 1;
+    ELSE IF (light_num = 8 && Light_8_FB = 1) state = 1;
+    ELSE IF (light_num = 9 && Light_9_FB = 1) state = 1;
+    ELSE IF (light_num = 10 && Light_10_FB = 1) state = 1;
+    ELSE IF (light_num = 11 && Light_11_FB = 1) state = 1;
+    ELSE IF (light_num = 12 && Light_12_FB = 1) state = 1;
+    ELSE IF (light_num = 13 && Light_13_FB = 1) state = 1;
+    ELSE IF (light_num = 14 && Light_14_FB = 1) state = 1;
+    ELSE IF (light_num = 15 && Light_15_FB = 1) state = 1;
+    ELSE IF (light_num = 16 && Light_16_FB = 1) state = 1;
+    
+    MakeString(temp, "STATUS:%d:%d\r\n", light_num, state);
+    SocketSend(myClient, temp);
+    TX_Debug$ = temp;
+}
+
+/*******************************************************************************************
+  FUNCTION: SendVideoStatus
+  Sends video routing status to ESPHome (VSTATUS:endpoint:source)
+*******************************************************************************************/
+FUNCTION SendVideoStatus(INTEGER endpoint, INTEGER source)
+{
+    STRING temp[50];
+    MakeString(temp, "VSTATUS:%d:%d\r\n", endpoint, source);
+    SocketSend(myClient, temp);
+    TX_Debug$ = temp;
+}
+
+/*******************************************************************************************
+  FUNCTION: SendVolumeStatus
+  Sends volume level to ESPHome (VOLSTATUS:zone:level)
+  Level is 0-65535
+*******************************************************************************************/
+FUNCTION SendVolumeStatus(INTEGER zone, INTEGER level)
+{
+    STRING temp[50];
+    MakeString(temp, "VOLSTATUS:%d:%d\r\n", zone, level);
+    SocketSend(myClient, temp);
+    TX_Debug$ = temp;
+}
+
+/*******************************************************************************************
+  FUNCTION: SendMuteStatus
+  Sends mute status to ESPHome (MUTE:zone:state)
+*******************************************************************************************/
+FUNCTION SendMuteStatus(INTEGER zone, INTEGER state)
+{
+    STRING temp[50];
+    MakeString(temp, "MUTE:%d:%d\r\n", zone, state);
+    SocketSend(myClient, temp);
+    TX_Debug$ = temp;
+}
+
+/*******************************************************************************************
+  FUNCTION: GetVideoFeedback
+  Gets current video routing feedback and sends to ESPHome
+*******************************************************************************************/
+FUNCTION GetVideoFeedback(INTEGER endpoint)
+{
+    INTEGER source;
+    source = 0;
+    
+    IF (endpoint = 1)
+    {
+        IF (Endpoint_1_Source_1_FB) source = 1;
+        ELSE IF (Endpoint_1_Source_2_FB) source = 2;
+        ELSE IF (Endpoint_1_Source_3_FB) source = 3;
+        ELSE IF (Endpoint_1_Source_4_FB) source = 4;
+        ELSE IF (Endpoint_1_Source_5_FB) source = 5;
+        ELSE IF (Endpoint_1_Source_6_FB) source = 6;
+        ELSE IF (Endpoint_1_Source_7_FB) source = 7;
+        ELSE IF (Endpoint_1_Source_8_FB) source = 8;
+    }
+    ELSE IF (endpoint = 2)
+    {
+        IF (Endpoint_2_Source_1_FB) source = 1;
+        ELSE IF (Endpoint_2_Source_2_FB) source = 2;
+        ELSE IF (Endpoint_2_Source_3_FB) source = 3;
+        ELSE IF (Endpoint_2_Source_4_FB) source = 4;
+        ELSE IF (Endpoint_2_Source_5_FB) source = 5;
+        ELSE IF (Endpoint_2_Source_6_FB) source = 6;
+        ELSE IF (Endpoint_2_Source_7_FB) source = 7;
+        ELSE IF (Endpoint_2_Source_8_FB) source = 8;
+    }
+    ELSE IF (endpoint = 3)
+    {
+        IF (Endpoint_3_Source_1_FB) source = 1;
+        ELSE IF (Endpoint_3_Source_2_FB) source = 2;
+        ELSE IF (Endpoint_3_Source_3_FB) source = 3;
+        ELSE IF (Endpoint_3_Source_4_FB) source = 4;
+        ELSE IF (Endpoint_3_Source_5_FB) source = 5;
+        ELSE IF (Endpoint_3_Source_6_FB) source = 6;
+        ELSE IF (Endpoint_3_Source_7_FB) source = 7;
+        ELSE IF (Endpoint_3_Source_8_FB) source = 8;
+    }
+    ELSE IF (endpoint = 4)
+    {
+        IF (Endpoint_4_Source_1_FB) source = 1;
+        ELSE IF (Endpoint_4_Source_2_FB) source = 2;
+        ELSE IF (Endpoint_4_Source_3_FB) source = 3;
+        ELSE IF (Endpoint_4_Source_4_FB) source = 4;
+        ELSE IF (Endpoint_4_Source_5_FB) source = 5;
+        ELSE IF (Endpoint_4_Source_6_FB) source = 6;
+        ELSE IF (Endpoint_4_Source_7_FB) source = 7;
+        ELSE IF (Endpoint_4_Source_8_FB) source = 8;
+    }
+    
+    SendVideoStatus(endpoint, source);
+}
+
+/*******************************************************************************************
+  FUNCTION: RouteVideo
+  Routes video to specified endpoint (pulses the appropriate output)
+*******************************************************************************************/
+FUNCTION RouteVideo(INTEGER endpoint, INTEGER source)
+{
+    IF (endpoint = 1)
+    {
+        Endpoint_1_Source_1 = OFF;
+        Endpoint_1_Source_2 = OFF;
+        Endpoint_1_Source_3 = OFF;
+        Endpoint_1_Source_4 = OFF;
+        Endpoint_1_Source_5 = OFF;
+        Endpoint_1_Source_6 = OFF;
+        Endpoint_1_Source_7 = OFF;
+        Endpoint_1_Source_8 = OFF;
+        
+        IF (source = 1) Endpoint_1_Source_1 = ON;
+        ELSE IF (source = 2) Endpoint_1_Source_2 = ON;
+        ELSE IF (source = 3) Endpoint_1_Source_3 = ON;
+        ELSE IF (source = 4) Endpoint_1_Source_4 = ON;
+        ELSE IF (source = 5) Endpoint_1_Source_5 = ON;
+        ELSE IF (source = 6) Endpoint_1_Source_6 = ON;
+        ELSE IF (source = 7) Endpoint_1_Source_7 = ON;
+        ELSE IF (source = 8) Endpoint_1_Source_8 = ON;
+    }
+    ELSE IF (endpoint = 2)
+    {
+        Endpoint_2_Source_1 = OFF;
+        Endpoint_2_Source_2 = OFF;
+        Endpoint_2_Source_3 = OFF;
+        Endpoint_2_Source_4 = OFF;
+        Endpoint_2_Source_5 = OFF;
+        Endpoint_2_Source_6 = OFF;
+        Endpoint_2_Source_7 = OFF;
+        Endpoint_2_Source_8 = OFF;
+        
+        IF (source = 1) Endpoint_2_Source_1 = ON;
+        ELSE IF (source = 2) Endpoint_2_Source_2 = ON;
+        ELSE IF (source = 3) Endpoint_2_Source_3 = ON;
+        ELSE IF (source = 4) Endpoint_2_Source_4 = ON;
+        ELSE IF (source = 5) Endpoint_2_Source_5 = ON;
+        ELSE IF (source = 6) Endpoint_2_Source_6 = ON;
+        ELSE IF (source = 7) Endpoint_2_Source_7 = ON;
+        ELSE IF (source = 8) Endpoint_2_Source_8 = ON;
+    }
+    ELSE IF (endpoint = 3)
+    {
+        Endpoint_3_Source_1 = OFF;
+        Endpoint_3_Source_2 = OFF;
+        Endpoint_3_Source_3 = OFF;
+        Endpoint_3_Source_4 = OFF;
+        Endpoint_3_Source_5 = OFF;
+        Endpoint_3_Source_6 = OFF;
+        Endpoint_3_Source_7 = OFF;
+        Endpoint_3_Source_8 = OFF;
+        
+        IF (source = 1) Endpoint_3_Source_1 = ON;
+        ELSE IF (source = 2) Endpoint_3_Source_2 = ON;
+        ELSE IF (source = 3) Endpoint_3_Source_3 = ON;
+        ELSE IF (source = 4) Endpoint_3_Source_4 = ON;
+        ELSE IF (source = 5) Endpoint_3_Source_5 = ON;
+        ELSE IF (source = 6) Endpoint_3_Source_6 = ON;
+        ELSE IF (source = 7) Endpoint_3_Source_7 = ON;
+        ELSE IF (source = 8) Endpoint_3_Source_8 = ON;
+    }
+    ELSE IF (endpoint = 4)
+    {
+        Endpoint_4_Source_1 = OFF;
+        Endpoint_4_Source_2 = OFF;
+        Endpoint_4_Source_3 = OFF;
+        Endpoint_4_Source_4 = OFF;
+        Endpoint_4_Source_5 = OFF;
+        Endpoint_4_Source_6 = OFF;
+        Endpoint_4_Source_7 = OFF;
+        Endpoint_4_Source_8 = OFF;
+        
+        IF (source = 1) Endpoint_4_Source_1 = ON;
+        ELSE IF (source = 2) Endpoint_4_Source_2 = ON;
+        ELSE IF (source = 3) Endpoint_4_Source_3 = ON;
+        ELSE IF (source = 4) Endpoint_4_Source_4 = ON;
+        ELSE IF (source = 5) Endpoint_4_Source_5 = ON;
+        ELSE IF (source = 6) Endpoint_4_Source_6 = ON;
+        ELSE IF (source = 7) Endpoint_4_Source_7 = ON;
+        ELSE IF (source = 8) Endpoint_4_Source_8 = ON;
+    }
+}
+
+/*******************************************************************************************
+  FUNCTION: SetVolume
+  Sets volume output (0-65535)
+*******************************************************************************************/
+FUNCTION SetVolume(INTEGER zone, INTEGER level)
+{
+    IF (zone = 1) Volume_1 = level;
+    ELSE IF (zone = 2) Volume_2 = level;
+    ELSE IF (zone = 3) Volume_3 = level;
+    ELSE IF (zone = 4) Volume_4 = level;
+}
+
+/*******************************************************************************************
+  FUNCTION: SetMute
+  Sets mute state
+*******************************************************************************************/
+FUNCTION SetMute(INTEGER zone, INTEGER state)
+{
+    IF (zone = 1) Mute_1 = state;
+    ELSE IF (zone = 2) Mute_2 = state;
+    ELSE IF (zone = 3) Mute_3 = state;
+    ELSE IF (zone = 4) Mute_4 = state;
+}
+
+/*******************************************************************************************
+  FUNCTION: AttemptReconnect
+  Attempts to reconnect to ESPHome after disconnection
+*******************************************************************************************/
+FUNCTION AttemptReconnect()
+{
+    IF (reconnect_timer_running = 1) RETURN;
+    
+    reconnect_timer_running = 1;
+    SocketDisconnectClient(myClient);
+    Status$ = "Reconnecting...";
+    UpdateConnectionFeedback(0);
+    
+    Wait(20, reconnect_wait)
+    {
+        INTEGER conn_status, port_num;
+        reconnect_timer_running = 0;
+        
+        // Convert string port to integer
+        port_num = Atoi(ESP_Port$);
+        
+        conn_status = SocketConnectClient(myClient, ESP_IP$, port_num, 0);
+        
+        IF (conn_status >= 0)
+        {
+            Status$ = "Connecting...";
+        }
+        ELSE
+        {
+            MakeString(Status$, "Reconnect failed: %d", conn_status);
+        }
+    }
+}
+
+/*******************************************************************************************
+  FUNCTION: ParseLine
+  Parses incoming commands from ESPHome
+  
+  Command Formats:
+    LIGHT:X:ON/OFF      - Control light X
+    QUERY:X             - Query light X status
+    VIDEO:E:S           - Route source S to endpoint E
+    VQUERY:E            - Query video endpoint E status
+    VOLUME:Z:L          - Set volume zone Z to level L (0-65535)
+    VOLQUERY:Z          - Query volume zone Z status
+    MUTE:Z:S            - Set mute zone Z to state S (0/1)
+    MUTEQUERY:Z         - Query mute zone Z status
+    KEEPALIVE           - Connection keepalive
+*******************************************************************************************/
+FUNCTION ParseLine(STRING cmd)
+{
+    INTEGER pos, light_num, video_endpoint, video_source;
+    STRING cmd_type[20], light_str[10], action[20], endpoint_str[10], source_str[10];
+    
+    RX_Debug$ = cmd;
+    
+    // Ignore keepalive messages
+    IF (cmd = "KEEPALIVE") RETURN;
+    
+    // Find command type
+    pos = Find(":", cmd);
+    IF (pos = 0) RETURN;
+    
+    cmd_type = Left(cmd, pos - 1);
+    cmd = Mid(cmd, pos + 1, Len(cmd) - pos);
+    
+    // Handle QUERY command (request light status)
+    IF (cmd_type = "QUERY")
+    {
+        light_num = Atoi(cmd);
+        IF (light_num >= 1 && light_num <= 16)
+        {
+            SendStatus(light_num);
+        }
+        RETURN;
+    }
+    
+    // Handle VQUERY command (request video status)
+    IF (cmd_type = "VQUERY")
+    {
+        video_endpoint = Atoi(cmd);
+        IF (video_endpoint >= 1 && video_endpoint <= 4)
+        {
+            GetVideoFeedback(video_endpoint);
+        }
+        RETURN;
+    }
+    
+    // Handle VOLQUERY command (request volume status)
+    IF (cmd_type = "VOLQUERY")
+    {
+        video_endpoint = Atoi(cmd);
+        IF (video_endpoint >= 1 && video_endpoint <= 4)
+        {
+            IF (video_endpoint = 1) SendVolumeStatus(1, Volume_1_FB);
+            ELSE IF (video_endpoint = 2) SendVolumeStatus(2, Volume_2_FB);
+            ELSE IF (video_endpoint = 3) SendVolumeStatus(3, Volume_3_FB);
+            ELSE IF (video_endpoint = 4) SendVolumeStatus(4, Volume_4_FB);
+        }
+        RETURN;
+    }
+    
+    // Handle MUTEQUERY command (request mute status)
+    IF (cmd_type = "MUTEQUERY")
+    {
+        video_endpoint = Atoi(cmd);
+        IF (video_endpoint >= 1 && video_endpoint <= 4)
+        {
+            IF (video_endpoint = 1) SendMuteStatus(1, Mute_1_FB);
+            ELSE IF (video_endpoint = 2) SendMuteStatus(2, Mute_2_FB);
+            ELSE IF (video_endpoint = 3) SendMuteStatus(3, Mute_3_FB);
+            ELSE IF (video_endpoint = 4) SendMuteStatus(4, Mute_4_FB);
+        }
+        RETURN;
+    }
+    
+    // Handle VIDEO command (route video)
+    IF (cmd_type = "VIDEO")
+    {
+        pos = Find(":", cmd);
+        IF (pos = 0) RETURN;
+        
+        endpoint_str = Left(cmd, pos - 1);
+        source_str = Mid(cmd, pos + 1, Len(cmd) - pos);
+        
+        video_endpoint = Atoi(endpoint_str);
+        video_source = Atoi(source_str);
+        
+        IF (video_endpoint >= 1 && video_endpoint <= 4 && video_source >= 0 && video_source <= 8)
+        {
+            RouteVideo(video_endpoint, video_source);
+        }
+        RETURN;
+    }
+    
+    // Handle VOLUME command (set volume level)
+    IF (cmd_type = "VOLUME")
+    {
+        pos = Find(":", cmd);
+        IF (pos = 0) RETURN;
+        
+        endpoint_str = Left(cmd, pos - 1);
+        source_str = Mid(cmd, pos + 1, Len(cmd) - pos);
+        
+        video_endpoint = Atoi(endpoint_str);
+        video_source = Atoi(source_str);  // Actually volume level 0-65535
+        
+        IF (video_endpoint >= 1 && video_endpoint <= 4 && video_source >= 0 && video_source <= 65535)
+        {
+            SetVolume(video_endpoint, video_source);
+        }
+        RETURN;
+    }
+    
+    // Handle MUTE command (set mute state)
+    IF (cmd_type = "MUTE")
+    {
+        pos = Find(":", cmd);
+        IF (pos = 0) RETURN;
+        
+        endpoint_str = Left(cmd, pos - 1);
+        source_str = Mid(cmd, pos + 1, Len(cmd) - pos);
+        
+        video_endpoint = Atoi(endpoint_str);
+        video_source = Atoi(source_str);  // 0 or 1
+        
+        IF (video_endpoint >= 1 && video_endpoint <= 4 && (video_source = 0 || video_source = 1))
+        {
+            SetMute(video_endpoint, video_source);
+        }
+        RETURN;
+    }
+    
+    // Handle LIGHT command
+    pos = Find(":", cmd);
+    IF (pos = 0) RETURN;
+    
+    light_str = Left(cmd, pos - 1);
+    action = Mid(cmd, pos + 1, Len(cmd) - pos);
+    light_num = Atoi(light_str);
+    
+    IF (light_num < 1 || light_num > 16) RETURN;
+    
+    IF (cmd_type = "LIGHT")
+    {
+        IF (action = "ON")
+        {
+            IF (light_num = 1) Light_1 = ON;
+            ELSE IF (light_num = 2) Light_2 = ON;
+            ELSE IF (light_num = 3) Light_3 = ON;
+            ELSE IF (light_num = 4) Light_4 = ON;
+            ELSE IF (light_num = 5) Light_5 = ON;
+            ELSE IF (light_num = 6) Light_6 = ON;
+            ELSE IF (light_num = 7) Light_7 = ON;
+            ELSE IF (light_num = 8) Light_8 = ON;
+            ELSE IF (light_num = 9) Light_9 = ON;
+            ELSE IF (light_num = 10) Light_10 = ON;
+            ELSE IF (light_num = 11) Light_11 = ON;
+            ELSE IF (light_num = 12) Light_12 = ON;
+            ELSE IF (light_num = 13) Light_13 = ON;
+            ELSE IF (light_num = 14) Light_14 = ON;
+            ELSE IF (light_num = 15) Light_15 = ON;
+            ELSE IF (light_num = 16) Light_16 = ON;
+        }
+        ELSE IF (action = "OFF")
+        {
+            IF (light_num = 1) Light_1 = OFF;
+            ELSE IF (light_num = 2) Light_2 = OFF;
+            ELSE IF (light_num = 3) Light_3 = OFF;
+            ELSE IF (light_num = 4) Light_4 = OFF;
+            ELSE IF (light_num = 5) Light_5 = OFF;
+            ELSE IF (light_num = 6) Light_6 = OFF;
+            ELSE IF (light_num = 7) Light_7 = OFF;
+            ELSE IF (light_num = 8) Light_8 = OFF;
+            ELSE IF (light_num = 9) Light_9 = OFF;
+            ELSE IF (light_num = 10) Light_10 = OFF;
+            ELSE IF (light_num = 11) Light_11 = OFF;
+            ELSE IF (light_num = 12) Light_12 = OFF;
+            ELSE IF (light_num = 13) Light_13 = OFF;
+            ELSE IF (light_num = 14) Light_14 = OFF;
+            ELSE IF (light_num = 15) Light_15 = OFF;
+            ELSE IF (light_num = 16) Light_16 = OFF;
+        }
+    }
+}
+
+/*******************************************************************************************
+  EVENT: SOCKETCONNECT
+  Called when TCP connection is established
+*******************************************************************************************/
+SOCKETCONNECT myClient
+{
+    manual_disconnect = 0;
+    Status$ = "Connected";
+    UpdateConnectionFeedback(1);
+}
+
+/*******************************************************************************************
+  EVENT: SOCKETDISCONNECT
+  Called when TCP connection is lost
+*******************************************************************************************/
+SOCKETDISCONNECT myClient
+{
+    IF (manual_disconnect = 1)
+    {
+        Status$ = "Manually disconnected";
+        UpdateConnectionFeedback(0);
+    }
+    ELSE
+    {
+        Status$ = "Disconnected - Auto-reconnect in 2s";
+        UpdateConnectionFeedback(0);
+        AttemptReconnect();
+    }
+}
+
+/*******************************************************************************************
+  EVENT: SOCKETSTATUS
+  Monitors socket status changes
+*******************************************************************************************/
+SOCKETSTATUS myClient
+{
+    INTEGER current_status;
+    current_status = SocketGetStatus();
+    
+    IF (current_status != last_socket_status)
+    {
+        last_socket_status = current_status;
+        
+        IF (current_status = 2)
+        {
+            Status$ = "Connected";
+            UpdateConnectionFeedback(1);
+        }
+        ELSE
+        {
+            MakeString(Status$, "Status: %d", current_status);
+            UpdateConnectionFeedback(0);
+        }
+    }
+}
+
+/*******************************************************************************************
+  EVENT: SOCKETRECEIVE
+  Handles incoming TCP data from ESPHome
+*******************************************************************************************/
+SOCKETRECEIVE myClient
+{
+    STRING line[200];
+    
+    WHILE (Find("\x0d\x0a", myClient.SocketRxBuf))
+    {
+        line = Remove("\x0d\x0a", myClient.SocketRxBuf);
+        IF (Len(line) >= 2)
+        {
+            line = Left(line, Len(line) - 2);
+        }
+        IF (Len(line) > 0)
+        {
+            ParseLine(line);
+        }
+    }
+}
+
+/*******************************************************************************************
+  EVENTS: Light Feedback Changes
+  Send status updates to ESPHome when lights change state
+*******************************************************************************************/
+CHANGE Light_1_FB  { SendStatus(1);  }
+CHANGE Light_2_FB  { SendStatus(2);  }
+CHANGE Light_3_FB  { SendStatus(3);  }
+CHANGE Light_4_FB  { SendStatus(4);  }
+CHANGE Light_5_FB  { SendStatus(5);  }
+CHANGE Light_6_FB  { SendStatus(6);  }
+CHANGE Light_7_FB  { SendStatus(7);  }
+CHANGE Light_8_FB  { SendStatus(8);  }
+CHANGE Light_9_FB  { SendStatus(9);  }
+CHANGE Light_10_FB { SendStatus(10); }
+CHANGE Light_11_FB { SendStatus(11); }
+CHANGE Light_12_FB { SendStatus(12); }
+CHANGE Light_13_FB { SendStatus(13); }
+CHANGE Light_14_FB { SendStatus(14); }
+CHANGE Light_15_FB { SendStatus(15); }
+CHANGE Light_16_FB { SendStatus(16); }
+
+/*******************************************************************************************
+  EVENTS: Video Routing Feedback Changes
+  Send video routing status updates to ESPHome when routes change
+*******************************************************************************************/
+CHANGE Endpoint_1_Source_1_FB, Endpoint_1_Source_2_FB, Endpoint_1_Source_3_FB, Endpoint_1_Source_4_FB,
+       Endpoint_1_Source_5_FB, Endpoint_1_Source_6_FB, Endpoint_1_Source_7_FB, Endpoint_1_Source_8_FB
+{
+    GetVideoFeedback(1);
+}
+
+CHANGE Endpoint_2_Source_1_FB, Endpoint_2_Source_2_FB, Endpoint_2_Source_3_FB, Endpoint_2_Source_4_FB,
+       Endpoint_2_Source_5_FB, Endpoint_2_Source_6_FB, Endpoint_2_Source_7_FB, Endpoint_2_Source_8_FB
+{
+    GetVideoFeedback(2);
+}
+
+CHANGE Endpoint_3_Source_1_FB, Endpoint_3_Source_2_FB, Endpoint_3_Source_3_FB, Endpoint_3_Source_4_FB,
+       Endpoint_3_Source_5_FB, Endpoint_3_Source_6_FB, Endpoint_3_Source_7_FB, Endpoint_3_Source_8_FB
+{
+    GetVideoFeedback(3);
+}
+
+CHANGE Endpoint_4_Source_1_FB, Endpoint_4_Source_2_FB, Endpoint_4_Source_3_FB, Endpoint_4_Source_4_FB,
+       Endpoint_4_Source_5_FB, Endpoint_4_Source_6_FB, Endpoint_4_Source_7_FB, Endpoint_4_Source_8_FB
+{
+    GetVideoFeedback(4);
+}
+
+/*******************************************************************************************
+  EVENTS: Volume Feedback Changes
+  Send volume status updates to ESPHome when levels change
+*******************************************************************************************/
+CHANGE Volume_1_FB { SendVolumeStatus(1, Volume_1_FB); }
+CHANGE Volume_2_FB { SendVolumeStatus(2, Volume_2_FB); }
+CHANGE Volume_3_FB { SendVolumeStatus(3, Volume_3_FB); }
+CHANGE Volume_4_FB { SendVolumeStatus(4, Volume_4_FB); }
+
+/*******************************************************************************************
+  EVENTS: Mute Feedback Changes
+  Send mute status updates to ESPHome when mute state changes
+*******************************************************************************************/
+CHANGE Mute_1_FB { SendMuteStatus(1, Mute_1_FB); }
+CHANGE Mute_2_FB { SendMuteStatus(2, Mute_2_FB); }
+CHANGE Mute_3_FB { SendMuteStatus(3, Mute_3_FB); }
+CHANGE Mute_4_FB { SendMuteStatus(4, Mute_4_FB); }
+
+/*******************************************************************************************
+  EVENT: Connect Button
+  Manually initiate connection to ESPHome
+*******************************************************************************************/
+PUSH Connect
+{
+    INTEGER conn_status, port_num;
+    manual_disconnect = 0;
+    
+    // Convert string port to integer
+    port_num = Atoi(ESP_Port$);
+    
+    conn_status = SocketConnectClient(myClient, ESP_IP$, port_num, 0);
+    
+    IF (conn_status >= 0)
+    {
+        Status$ = "Connecting...";
+    }
+    ELSE
+    {
+        MakeString(Status$, "Connect error %d", conn_status);
+        UpdateConnectionFeedback(0);
+    }
+}
+
+/*******************************************************************************************
+  EVENT: Disconnect Button
+  Manually disconnect from ESPHome
+*******************************************************************************************/
+PUSH Disconnect
+{
+    manual_disconnect = 1;
+    SocketDisconnectClient(myClient);
+    Status$ = "Manually disconnected";
+    UpdateConnectionFeedback(0);
+}
+
+/*******************************************************************************************
+  FUNCTION: Main
+  Module initialization
+*******************************************************************************************/
+FUNCTION Main()
+{
+    WaitForInitializationComplete();
+    
+    last_socket_status = 0;
+    reconnect_timer_running = 0;
+    manual_disconnect = 0;
+    
+    Status$ = "Idle";
+    UpdateConnectionFeedback(0);
+}

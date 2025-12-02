@@ -1,0 +1,894 @@
+# Global variables for TCP communication and state tracking
+globals:
+  - id: tcp_server
+    type: WiFiServer*
+    restore_value: no
+    initial_value: "nullptr"
+
+  - id: tcp_client
+    type: WiFiClient*
+    restore_value: no
+    initial_value: "nullptr"
+
+# Scripts for sending commands to Crestron
+script:
+  - id: crestron_send_light
+    parameters:
+      light_num: int
+      state: bool
+    then:
+      - lambda: |-
+          if (!id(tcp_client) || !id(tcp_client)->connected()) {
+            ESP_LOGW("crestron", "Cannot send light command - not connected");
+            return;
+          }
+          
+          char buf[32];
+          snprintf(buf, sizeof(buf), "LIGHT:%d:%s\r\n", light_num, state ? "ON" : "OFF");
+          id(tcp_client)->print(buf);
+          ESP_LOGI("crestron", "TX: %s", buf);
+
+  - id: crestron_send_video
+    parameters:
+      endpoint: int
+      source: int
+    then:
+      - lambda: |-
+          if (!id(tcp_client) || !id(tcp_client)->connected()) {
+            ESP_LOGW("crestron", "Cannot send video command - not connected");
+            return;
+          }
+          
+          char buf[32];
+          snprintf(buf, sizeof(buf), "VIDEO:%d:%d\r\n", endpoint, source);
+          id(tcp_client)->print(buf);
+          ESP_LOGI("crestron", "TX: %s", buf);
+
+  - id: crestron_send_volume
+    parameters:
+      zone: int
+      level: int
+    then:
+      - lambda: |-
+          if (!id(tcp_client) || !id(tcp_client)->connected()) {
+            ESP_LOGW("crestron", "Cannot send volume command - not connected");
+            return;
+          }
+          
+          // Convert 0-100 to 0-65535 (Crestron unsigned analog)
+          uint16_t crestron_level = (level * 65535) / 100;
+          
+          char buf[32];
+          snprintf(buf, sizeof(buf), "VOLUME:%d:%u\r\n", zone, crestron_level);
+          id(tcp_client)->print(buf);
+          ESP_LOGI("crestron", "TX: %s", buf);
+
+  - id: crestron_send_mute
+    parameters:
+      zone: int
+      state: bool
+    then:
+      - lambda: |-
+          if (!id(tcp_client) || !id(tcp_client)->connected()) {
+            ESP_LOGW("crestron", "Cannot send mute command - not connected");
+            return;
+          }
+          
+          char buf[32];
+          snprintf(buf, sizeof(buf), "MUTE:%d:%d\r\n", zone, state ? 1 : 0);
+          id(tcp_client)->print(buf);
+          ESP_LOGI("crestron", "TX: %s", buf);
+
+  - id: crestron_query_all
+    then:
+      - lambda: |-
+          if (!id(tcp_client) || !id(tcp_client)->connected()) return;
+          
+          // Query all light states
+          for (int i = 1; i <= 16; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "QUERY:%d\r\n", i);
+            id(tcp_client)->print(buf);
+            delay(50);
+          }
+          
+          // Query all video endpoint sources
+          for (int i = 1; i <= 4; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "VQUERY:%d\r\n", i);
+            id(tcp_client)->print(buf);
+            delay(50);
+          }
+          
+          // Query all volume zone levels
+          for (int i = 1; i <= 4; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "VOLQUERY:%d\r\n", i);
+            id(tcp_client)->print(buf);
+            delay(50);
+          }
+          
+          // Query all mute states
+          for (int i = 1; i <= 4; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "MUTEQUERY:%d\r\n", i);
+            id(tcp_client)->print(buf);
+            delay(50);
+          }
+
+interval:
+  # Main TCP server and message processing loop
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Initialize server on first run
+          if (!id(tcp_server)) {
+            id(tcp_server) = new WiFiServer(${crestron_port});
+            id(tcp_server)->begin();
+            id(tcp_server)->setNoDelay(true);
+            ESP_LOGI("crestron", "TCP server started on port ${crestron_port}");
+          }
+          
+          // Initialize client pointer if null
+          if (!id(tcp_client)) {
+            id(tcp_client) = new WiFiClient();
+          }
+          
+          // Accept new client if not connected
+          if (!id(tcp_client)->connected()) {
+            WiFiClient new_client = id(tcp_server)->accept();
+            if (new_client) {
+              *id(tcp_client) = new_client;
+              id(tcp_client)->setNoDelay(true);
+              id(rx_buffer).clear();
+              id(synced) = false;
+              ESP_LOGI("crestron", "Crestron connected from %s", id(tcp_client)->remoteIP().toString().c_str());
+              id(crestron_connection_status).publish_state("Connected");
+              
+              // Auto-sync on connection
+              delay(500);
+              id(crestron_query_all).execute();
+            } else {
+              id(crestron_connection_status).publish_state("Disconnected");
+              return;
+            }
+          }
+          
+          // Read available data
+          while (id(tcp_client)->available()) {
+            char c = id(tcp_client)->read();
+            id(rx_buffer) += c;
+            
+            // Process complete lines
+            size_t pos;
+            while ((pos = id(rx_buffer).find('\n')) != std::string::npos) {
+              std::string line = id(rx_buffer).substr(0, pos);
+              id(rx_buffer).erase(0, pos + 1);
+              
+              if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+              }
+              
+              if (line.empty()) continue;
+              
+              ESP_LOGD("crestron", "RX: %s", line.c_str());
+              
+              if (line == "KEEPALIVE") continue;
+              
+              // Handle STATUS messages (light feedback from Crestron)
+              if (line.rfind("STATUS:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int light = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  bool state = (line.substr(c2 + 1) == "1");
+                  
+                  if (light == 1) id(light_1).publish_state(state);
+                  else if (light == 2) id(light_2).publish_state(state);
+                  else if (light == 3) id(light_3).publish_state(state);
+                  else if (light == 4) id(light_4).publish_state(state);
+                  else if (light == 5) id(light_5).publish_state(state);
+                  else if (light == 6) id(light_6).publish_state(state);
+                  else if (light == 7) id(light_7).publish_state(state);
+                  else if (light == 8) id(light_8).publish_state(state);
+                  else if (light == 9) id(light_9).publish_state(state);
+                  else if (light == 10) id(light_10).publish_state(state);
+                  else if (light == 11) id(light_11).publish_state(state);
+                  else if (light == 12) id(light_12).publish_state(state);
+                  else if (light == 13) id(light_13).publish_state(state);
+                  else if (light == 14) id(light_14).publish_state(state);
+                  else if (light == 15) id(light_15).publish_state(state);
+                  else if (light == 16) id(light_16).publish_state(state);
+                  
+                  id(synced) = true;
+                }
+                continue;
+              }
+              
+              // Handle VSTATUS messages (video source feedback from Crestron)
+              if (line.rfind("VSTATUS:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int endpoint = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  int source = std::stoi(line.substr(c2 + 1));
+                  
+                  const char* options[] = {"Off", "${source_1_name}", "${source_2_name}", "${source_3_name}", 
+                                          "${source_4_name}", "${source_5_name}", "${source_6_name}", 
+                                          "${source_7_name}", "${source_8_name}"};
+                  
+                  if (source >= 0 && source <= 8) {
+                    if (endpoint == 1) id(endpoint_1_select).publish_state(options[source]);
+                    else if (endpoint == 2) id(endpoint_2_select).publish_state(options[source]);
+                    else if (endpoint == 3) id(endpoint_3_select).publish_state(options[source]);
+                    else if (endpoint == 4) id(endpoint_4_select).publish_state(options[source]);
+                  }
+                }
+                continue;
+              }
+              
+              // Handle VOLSTATUS messages (volume feedback from Crestron)
+              if (line.rfind("VOLSTATUS:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int zone = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  uint16_t crestron_level = std::stoi(line.substr(c2 + 1));
+                  
+                  // Convert 0-65535 to 0-100
+                  float ha_level = (crestron_level * 100.0f) / 65535.0f;
+                  
+                  if (zone == 1) id(volume_1).publish_state(ha_level);
+                  else if (zone == 2) id(volume_2).publish_state(ha_level);
+                  else if (zone == 3) id(volume_3).publish_state(ha_level);
+                  else if (zone == 4) id(volume_4).publish_state(ha_level);
+                }
+                continue;
+              }
+              
+              // Handle LIGHT commands (control from Crestron keypads)
+              if (line.rfind("LIGHT:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int light = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  std::string action = line.substr(c2 + 1);
+                  bool turn_on = (action == "ON");
+                  
+                  if (light == 1) { if (turn_on) id(light_1).turn_on(); else id(light_1).turn_off(); }
+                  else if (light == 2) { if (turn_on) id(light_2).turn_on(); else id(light_2).turn_off(); }
+                  else if (light == 3) { if (turn_on) id(light_3).turn_on(); else id(light_3).turn_off(); }
+                  else if (light == 4) { if (turn_on) id(light_4).turn_on(); else id(light_4).turn_off(); }
+                  else if (light == 5) { if (turn_on) id(light_5).turn_on(); else id(light_5).turn_off(); }
+                  else if (light == 6) { if (turn_on) id(light_6).turn_on(); else id(light_6).turn_off(); }
+                  else if (light == 7) { if (turn_on) id(light_7).turn_on(); else id(light_7).turn_off(); }
+                  else if (light == 8) { if (turn_on) id(light_8).turn_on(); else id(light_8).turn_off(); }
+                  else if (light == 9) { if (turn_on) id(light_9).turn_on(); else id(light_9).turn_off(); }
+                  else if (light == 10) { if (turn_on) id(light_10).turn_on(); else id(light_10).turn_off(); }
+                  else if (light == 11) { if (turn_on) id(light_11).turn_on(); else id(light_11).turn_off(); }
+                  else if (light == 12) { if (turn_on) id(light_12).turn_on(); else id(light_12).turn_off(); }
+                  else if (light == 13) { if (turn_on) id(light_13).turn_on(); else id(light_13).turn_off(); }
+                  else if (light == 14) { if (turn_on) id(light_14).turn_on(); else id(light_14).turn_off(); }
+                  else if (light == 15) { if (turn_on) id(light_15).turn_on(); else id(light_15).turn_off(); }
+                  else if (light == 16) { if (turn_on) id(light_16).turn_on(); else id(light_16).turn_off(); }
+                }
+                continue;
+              }
+              
+              // Handle QUERY requests (Crestron asking for light state)
+              if (line.rfind("QUERY:", 0) == 0) {
+                int light = std::stoi(line.substr(6));
+                if (light >= 1 && light <= 16) {
+                  bool state = false;
+                  if (light == 1) state = id(light_1).state;
+                  else if (light == 2) state = id(light_2).state;
+                  else if (light == 3) state = id(light_3).state;
+                  else if (light == 4) state = id(light_4).state;
+                  else if (light == 5) state = id(light_5).state;
+                  else if (light == 6) state = id(light_6).state;
+                  else if (light == 7) state = id(light_7).state;
+                  else if (light == 8) state = id(light_8).state;
+                  else if (light == 9) state = id(light_9).state;
+                  else if (light == 10) state = id(light_10).state;
+                  else if (light == 11) state = id(light_11).state;
+                  else if (light == 12) state = id(light_12).state;
+                  else if (light == 13) state = id(light_13).state;
+                  else if (light == 14) state = id(light_14).state;
+                  else if (light == 15) state = id(light_15).state;
+                  else if (light == 16) state = id(light_16).state;
+                  
+                  char resp[32];
+                  snprintf(resp, sizeof(resp), "STATUS:%d:%d\r\n", light, state ? 1 : 0);
+                  id(tcp_client)->print(resp);
+                }
+                continue;
+              }
+              
+              // Handle VQUERY requests (Crestron asking for video source)
+              if (line.rfind("VQUERY:", 0) == 0) {
+                int endpoint = std::stoi(line.substr(7));
+                if (endpoint >= 1 && endpoint <= 4) {
+                  std::string sel;
+                  if (endpoint == 1) sel = id(endpoint_1_select).current_option();
+                  else if (endpoint == 2) sel = id(endpoint_2_select).current_option();
+                  else if (endpoint == 3) sel = id(endpoint_3_select).current_option();
+                  else if (endpoint == 4) sel = id(endpoint_4_select).current_option();
+                  
+                  int source = 0;
+                  if (sel == "${source_1_name}") source = 1;
+                  else if (sel == "${source_2_name}") source = 2;
+                  else if (sel == "${source_3_name}") source = 3;
+                  else if (sel == "${source_4_name}") source = 4;
+                  else if (sel == "${source_5_name}") source = 5;
+                  else if (sel == "${source_6_name}") source = 6;
+                  else if (sel == "${source_7_name}") source = 7;
+                  else if (sel == "${source_8_name}") source = 8;
+                  
+                  char resp[32];
+                  snprintf(resp, sizeof(resp), "VSTATUS:%d:%d\r\n", endpoint, source);
+                  id(tcp_client)->print(resp);
+                }
+                continue;
+              }
+              
+              // Handle VOLQUERY requests (Crestron asking for volume level)
+              if (line.rfind("VOLQUERY:", 0) == 0) {
+                int zone = std::stoi(line.substr(9));
+                if (zone >= 1 && zone <= 4) {
+                  float ha_level = 0;
+                  if (zone == 1) ha_level = id(volume_1).state;
+                  else if (zone == 2) ha_level = id(volume_2).state;
+                  else if (zone == 3) ha_level = id(volume_3).state;
+                  else if (zone == 4) ha_level = id(volume_4).state;
+                  
+                  // Convert 0-100 to 0-65535
+                  uint16_t crestron_level = (ha_level * 65535) / 100;
+                  
+                  char resp[32];
+                  snprintf(resp, sizeof(resp), "VOLSTATUS:%d:%u\r\n", zone, crestron_level);
+                  id(tcp_client)->print(resp);
+                }
+                continue;
+              }
+              
+              // Handle MUTEQUERY requests (Crestron asking for mute state)
+              if (line.rfind("MUTEQUERY:", 0) == 0) {
+                int zone = std::stoi(line.substr(10));
+                if (zone >= 1 && zone <= 4) {
+                  bool muted = false;
+                  if (zone == 1) muted = id(mute_1).state;
+                  else if (zone == 2) muted = id(mute_2).state;
+                  else if (zone == 3) muted = id(mute_3).state;
+                  else if (zone == 4) muted = id(mute_4).state;
+                  
+                  char resp[32];
+                  snprintf(resp, sizeof(resp), "MUTE:%d:%d\r\n", zone, muted ? 1 : 0);
+                  id(tcp_client)->print(resp);
+                }
+                continue;
+              }
+              
+              // Handle VIDEO commands (control from Crestron touchpanels)
+              if (line.rfind("VIDEO:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int endpoint = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  int source = std::stoi(line.substr(c2 + 1));
+                  
+                  const char* options[] = {"Off", "${source_1_name}", "${source_2_name}", "${source_3_name}", 
+                                          "${source_4_name}", "${source_5_name}", "${source_6_name}", 
+                                          "${source_7_name}", "${source_8_name}"};
+                  
+                  if (source >= 0 && source <= 8) {
+                    if (endpoint == 1) id(endpoint_1_select).publish_state(options[source]);
+                    else if (endpoint == 2) id(endpoint_2_select).publish_state(options[source]);
+                    else if (endpoint == 3) id(endpoint_3_select).publish_state(options[source]);
+                    else if (endpoint == 4) id(endpoint_4_select).publish_state(options[source]);
+                  }
+                }
+                continue;
+              }
+              
+              // Handle VOLUME commands (control from Crestron touchpanels)
+              if (line.rfind("VOLUME:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int zone = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  uint16_t crestron_level = std::stoi(line.substr(c2 + 1));
+                  
+                  // Convert 0-65535 to 0-100
+                  float ha_level = (crestron_level * 100.0f) / 65535.0f;
+                  
+                  if (zone == 1) id(volume_1).publish_state(ha_level);
+                  else if (zone == 2) id(volume_2).publish_state(ha_level);
+                  else if (zone == 3) id(volume_3).publish_state(ha_level);
+                  else if (zone == 4) id(volume_4).publish_state(ha_level);
+                }
+                continue;
+              }
+              
+              // Handle MUTE messages (mute feedback from Crestron)
+              if (line.rfind("MUTE:", 0) == 0) {
+                size_t c1 = line.find(':');
+                size_t c2 = line.find(':', c1 + 1);
+                if (c1 != std::string::npos && c2 != std::string::npos) {
+                  int zone = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+                  bool muted = (line.substr(c2 + 1) == "1");
+                  
+                  if (zone == 1) id(mute_1).publish_state(muted);
+                  else if (zone == 2) id(mute_2).publish_state(muted);
+                  else if (zone == 3) id(mute_3).publish_state(muted);
+                  else if (zone == 4) id(mute_4).publish_state(muted);
+                }
+                continue;
+              }
+            }
+          }
+
+  # Send keepalive packets every 30 seconds
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (id(tcp_client) && id(tcp_client)->connected()) {
+            id(tcp_client)->print("KEEPALIVE\r\n");
+          }
+
+  # Auto-resync all states every hour
+  - interval: 1h
+    then:
+      - script.execute: crestron_query_all
+
+# Diagnostic buttons
+button:
+  - platform: template
+    name: "Restart ESP32"
+    icon: "mdi:restart"
+    on_press:
+      - lambda: |-
+          ESP.restart();
+    entity_category: "diagnostic"
+
+  - platform: template
+    name: "Resync All Crestron States"
+    icon: "mdi:sync"
+    on_press:
+      - script.execute: crestron_query_all
+    entity_category: "diagnostic"
+
+# Connection status indicator
+text_sensor:
+  - platform: template
+    id: crestron_connection_status
+    name: "Crestron Connection Status"
+    icon: "mdi:lan-connect"
+    entity_category: "diagnostic"
+    update_interval: never
+
+# Light switches (16 channels)
+switch:
+  - platform: template
+    id: light_1
+    name: "Crestron Light 1"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 1
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 1
+          state: false
+
+  - platform: template
+    id: light_2
+    name: "Crestron Light 2"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 2
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 2
+          state: false
+
+  - platform: template
+    id: light_3
+    name: "Crestron Light 3"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 3
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 3
+          state: false
+
+  - platform: template
+    id: light_4
+    name: "Crestron Light 4"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 4
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 4
+          state: false
+
+  - platform: template
+    id: light_5
+    name: "Crestron Light 5"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 5
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 5
+          state: false
+
+  - platform: template
+    id: light_6
+    name: "Crestron Light 6"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 6
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 6
+          state: false
+
+  - platform: template
+    id: light_7
+    name: "Crestron Light 7"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 7
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 7
+          state: false
+
+  - platform: template
+    id: light_8
+    name: "Crestron Light 8"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 8
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 8
+          state: false
+
+  - platform: template
+    id: light_9
+    name: "Crestron Light 9"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 9
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 9
+          state: false
+
+  - platform: template
+    id: light_10
+    name: "Crestron Light 10"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 10
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 10
+          state: false
+
+  - platform: template
+    id: light_11
+    name: "Crestron Light 11"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 11
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 11
+          state: false
+
+  - platform: template
+    id: light_12
+    name: "Crestron Light 12"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 12
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 12
+          state: false
+
+  - platform: template
+    id: light_13
+    name: "Crestron Light 13"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 13
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 13
+          state: false
+
+  - platform: template
+    id: light_14
+    name: "Crestron Light 14"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 14
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 14
+          state: false
+
+  - platform: template
+    id: light_15
+    name: "Crestron Light 15"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 15
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 15
+          state: false
+
+  - platform: template
+    id: light_16
+    name: "Crestron Light 16"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 16
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_light
+          light_num: 16
+          state: false
+
+  # Mute switches (4 zones)
+  - platform: template
+    name: "${volume_1_name} Mute"
+    id: mute_1
+    icon: "mdi:volume-off"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 1
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 1
+          state: false
+
+  - platform: template
+    name: "${volume_2_name} Mute"
+    id: mute_2
+    icon: "mdi:volume-off"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 2
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 2
+          state: false
+
+  - platform: template
+    name: "${volume_3_name} Mute"
+    id: mute_3
+    icon: "mdi:volume-off"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 3
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 3
+          state: false
+
+  - platform: template
+    name: "${volume_4_name} Mute"
+    id: mute_4
+    icon: "mdi:volume-off"
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 4
+          state: true
+    turn_off_action:
+      - script.execute:
+          id: crestron_send_mute
+          zone: 4
+          state: false
+
+# Video source selectors (4 endpoints)
+select:
+  - platform: template
+    name: "${endpoint_1_name} Source"
+    id: endpoint_1_select
+    optimistic: true
+    options: ["Off","${source_1_name}","${source_2_name}","${source_3_name}","${source_4_name}","${source_5_name}","${source_6_name}","${source_7_name}","${source_8_name}"]
+    set_action:
+      - lambda: |-
+          int source = 0;
+          if (x == "${source_1_name}") source = 1;
+          else if (x == "${source_2_name}") source = 2;
+          else if (x == "${source_3_name}") source = 3;
+          else if (x == "${source_4_name}") source = 4;
+          else if (x == "${source_5_name}") source = 5;
+          else if (x == "${source_6_name}") source = 6;
+          else if (x == "${source_7_name}") source = 7;
+          else if (x == "${source_8_name}") source = 8;
+          id(crestron_send_video).execute(1, source);
+
+  - platform: template
+    name: "${endpoint_2_name} Source"
+    id: endpoint_2_select
+    optimistic: true
+    options: ["Off","${source_1_name}","${source_2_name}","${source_3_name}","${source_4_name}","${source_5_name}","${source_6_name}","${source_7_name}","${source_8_name}"]
+    set_action:
+      - lambda: |-
+          int source = 0;
+          if (x == "${source_1_name}") source = 1;
+          else if (x == "${source_2_name}") source = 2;
+          else if (x == "${source_3_name}") source = 3;
+          else if (x == "${source_4_name}") source = 4;
+          else if (x == "${source_5_name}") source = 5;
+          else if (x == "${source_6_name}") source = 6;
+          else if (x == "${source_7_name}") source = 7;
+          else if (x == "${source_8_name}") source = 8;
+          id(crestron_send_video).execute(2, source);
+
+  - platform: template
+    name: "${endpoint_3_name} Source"
+    id: endpoint_3_select
+    optimistic: true
+    options: ["Off","${source_1_name}","${source_2_name}","${source_3_name}","${source_4_name}","${source_5_name}","${source_6_name}","${source_7_name}","${source_8_name}"]
+    set_action:
+      - lambda: |-
+          int source = 0;
+          if (x == "${source_1_name}") source = 1;
+          else if (x == "${source_2_name}") source = 2;
+          else if (x == "${source_3_name}") source = 3;
+          else if (x == "${source_4_name}") source = 4;
+          else if (x == "${source_5_name}") source = 5;
+          else if (x == "${source_6_name}") source = 6;
+          else if (x == "${source_7_name}") source = 7;
+          else if (x == "${source_8_name}") source = 8;
+          id(crestron_send_video).execute(3, source);
+
+  - platform: template
+    name: "${endpoint_4_name} Source"
+    id: endpoint_4_select
+    optimistic: true
+    options: ["Off","${source_1_name}","${source_2_name}","${source_3_name}","${source_4_name}","${source_5_name}","${source_6_name}","${source_7_name}","${source_8_name}"]
+    set_action:
+      - lambda: |-
+          int source = 0;
+          if (x == "${source_1_name}") source = 1;
+          else if (x == "${source_2_name}") source = 2;
+          else if (x == "${source_3_name}") source = 3;
+          else if (x == "${source_4_name}") source = 4;
+          else if (x == "${source_5_name}") source = 5;
+          else if (x == "${source_6_name}") source = 6;
+          else if (x == "${source_7_name}") source = 7;
+          else if (x == "${source_8_name}") source = 8;
+          id(crestron_send_video).execute(4, source);
+
+# Volume controls (4 zones, 0-100%)
+number:
+  - platform: template
+    name: "${volume_1_name} Volume"
+    id: volume_1
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    set_action:
+      - lambda: |-
+          id(crestron_send_volume).execute(1, (int)x);
+
+  - platform: template
+    name: "${volume_2_name} Volume"
+    id: volume_2
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    set_action:
+      - lambda: |-
+          id(crestron_send_volume).execute(2, (int)x);
+
+  - platform: template
+    name: "${volume_3_name} Volume"
+    id: volume_3
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    set_action:
+      - lambda: |-
+          id(crestron_send_volume).execute(3, (int)x);
+
+  - platform: template
+    name: "${volume_4_name} Volume"
+    id: volume_4
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    set_action:
+      - lambda: |-
+          id(crestron_send_volume).execute(4, (int)x);
