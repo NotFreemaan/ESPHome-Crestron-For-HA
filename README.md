@@ -473,8 +473,7 @@ ESP32 Board:                         - ESP32-C3-DEVKITM-1
 ## Photos
 
 ![image alt](images/ESPHome-1.png) 
-![image alt](images/ESPHome-2.png) 
-![image alt](images/ESPHome-3.png)
+![image alt](images/ESPHome-2.png) ![image alt](images/ESPHome-3.png)
 ![image alt](images/SIMPL-Windows-Module.png)
 
 ---
